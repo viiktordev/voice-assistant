@@ -1,0 +1,57 @@
+<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Local Voice Assistant</title><style>
+:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;color:#ebedf5;background:#0d1019}*{box-sizing:border-box}body{margin:0}main{max-width:850px;margin:48px auto;padding:0 20px}h1{font-size:28px;margin-bottom:5px}.sub{color:#9aa5bc;margin-bottom:28px}.panel{background:#171c29;border:1px solid #2d3548;border-radius:16px;padding:22px}.tools{display:flex;gap:10px;flex-wrap:wrap;align-items:center}button{border:0;border-radius:10px;background:#7967ee;color:white;font-weight:650;padding:12px 18px;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}button.secondary{background:#303950}.status{color:#a9b7d0;font-size:14px;margin:15px 0}.status.error{color:#ffa9a9}.chat{min-height:240px;max-height:420px;overflow:auto;padding:20px 0;display:flex;flex-direction:column;gap:13px}.bubble{border-radius:12px;padding:12px 15px;max-width:85%;line-height:1.55;white-space:pre-wrap;background:#293247}.bubble.user{align-self:flex-end;background:#353267}.bubble.assistant{align-self:flex-start}.bubble.live{opacity:.65}form{display:flex;gap:8px}input{background:#0e1420;color:white;border:1px solid #364055;border-radius:10px;padding:12px;flex:1;min-width:0}label{display:flex;align-items:center;gap:6px;color:#a9b7d0;font-size:14px}.pill{display:inline-block;font-size:12px;border:1px solid #37425b;padding:5px 9px;border-radius:99px;color:#a9b7d0}@media(max-width:480px){main{margin:22px auto}.tools{align-items:stretch}button{flex:1}}
+</style></head><body><main><span class="pill">Local AI • Nemotron + Ollama + Qwen3-TTS</span><h1>Assistente de voz</h1><p class="sub">Clique em Falar e fale normalmente: quando você parar, a mensagem é enviada sozinha.</p><section class="panel"><div class="tools"><button id="record">🎙️ Falar</button><button id="stop" class="secondary" disabled>■ Enviar agora</button><button id="cancel" class="secondary">Limpar conversa</button><label><input type="checkbox" id="speak" checked/> Reproduzir voz</label><label><input type="checkbox" id="auto" checked/> Conversa contínua</label></div><p class="status" id="status">Pronto para ouvir.</p><div class="chat" id="chat" aria-live="polite"></div><form id="form"><input id="message" placeholder="Ou digite uma mensagem…" autocomplete="off"/><button type="submit">Enviar</button></form></section></main><script>
+const $=id=>document.getElementById(id);let history=[],busy=false,turn=null,conversing=false;
+function status(msg,error=false){$('status').textContent=msg;$('status').className='status'+(error?' error':'')}
+function bubble(role,text){const item=document.createElement('div');item.className='bubble '+role;item.textContent=text;$('chat').appendChild(item);$('chat').scrollTop=$('chat').scrollHeight;return item}
+function lock(flag){busy=flag;$('record').disabled=flag&&!conversing;$('form').querySelector('button').disabled=flag}
+// Fila de áudio: o PCM chega em pedaços enquanto o TTS gera e cada pedaço é agendado logo após o anterior.
+let ctx=null,sources=[],nextTime=0,audioRate=24000;
+function audioCtx(){ctx??=new AudioContext();if(ctx.state==='suspended')ctx.resume();return ctx}
+function stopAudio(){sources.forEach(s=>{try{s.stop()}catch{}});sources=[];nextTime=0}
+function enqueueAudio(data){const pcm=new Int16Array(data),buf=audioCtx().createBuffer(1,pcm.length,audioRate),ch=buf.getChannelData(0);for(let i=0;i<pcm.length;i++)ch[i]=pcm[i]/32768;
+const src=ctx.createBufferSource();src.buffer=buf;src.connect(ctx.destination);const at=Math.max(ctx.currentTime+.05,nextTime);src.start(at);nextTime=at+buf.duration;sources.push(src);
+src.onended=()=>{sources=sources.filter(s=>s!==src);if(!sources.length&&!busy){status('Pronto para ouvir.');listenAgain()}}}
+function abortTurn(){if(turn)turn.finish();stopAudio()}
+function converse(text){abortTurn();lock(true);bubble('user',text);status('Consultando Ollama…');const speak=$('speak').checked;if(speak)audioCtx();const item=bubble('assistant','');
+return new Promise(resolve=>{const socket=new WebSocket(wsUrl('/ws/chat'));socket.binaryType='arraybuffer';
+const finish=(msg,error=false)=>{if(turn?.socket!==socket)return;turn=null;socket.onclose=null;socket.close();if(!item.textContent)item.remove();if(msg)status(msg,error);lock(false);resolve()};turn={socket,finish};
+socket.onopen=()=>socket.send(JSON.stringify({text,history,speak}));
+socket.onmessage=e=>{if(typeof e.data!=='string'){status('Falando…');enqueueAudio(e.data);return}const m=JSON.parse(e.data);
+if(m.type==='audio_format')audioRate=m.sample_rate;
+else if(m.type==='delta'){if(!item.textContent)status(speak?'Gerando resposta e áudio…':'Gerando resposta…');item.textContent+=m.text;$('chat').scrollTop=$('chat').scrollHeight}
+else if(m.type==='text'){item.textContent=m.text;history.push({role:'user',content:text},{role:'assistant',content:m.text})}
+else if(m.type==='done'){finish(sources.length?null:'Pronto para ouvir.');listenAgain()}
+else if(m.type==='error'){setConversing(false);finish(m.detail,true)}};
+socket.onclose=()=>{setConversing(false);finish('Conexão encerrada antes do fim da resposta.',true)}})}
+// Supressão de ruído e ganho automático do navegador comem o início da fala ("Oi" sumia); o ASR lida bem com ruído.
+// Captura: AudioWorklet reamostra o microfone para PCM 16 kHz mono (s16le) em blocos de 100 ms.
+const WORKLET=`registerProcessor('pcm16',class extends AudioWorkletProcessor{constructor(){super();this.step=sampleRate/16000;this.pos=0;this.buf=new Int16Array(1600);this.n=0}
+process([input]){const ch=input[0];if(!ch)return true;while(this.pos<ch.length){const i=Math.floor(this.pos),f=this.pos-i,a=ch[i],b=i+1<ch.length?ch[i+1]:a;this.buf[this.n++]=Math.max(-1,Math.min(1,a+(b-a)*f))*32767;if(this.n===1600){this.port.postMessage(this.buf.buffer,[this.buf.buffer]);this.buf=new Int16Array(1600);this.n=0}this.pos+=this.step}this.pos-=ch.length;return true}})`;
+let workletReady=null,listening=null;
+// Conversa contínua: depois que a resposta termina (texto pronto e áudio tocado), volta a ouvir sozinho.
+function setConversing(on){conversing=on;$('record').textContent=on?'⏹ Encerrar':'🎙️ Falar';$('record').disabled=busy&&!on}
+function listenAgain(){if(conversing&&!busy&&!listening&&!sources.length)startListening()}
+async function startListening(){try{await listen()}catch(e){setConversing(false);status('Microfone: '+e.message,true);lock(false)}}
+const wsUrl=path=>`${location.protocol==='https:'?'wss':'ws'}://${location.host}${path}`;
+async function listen(){const ctx=audioCtx();const mic=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:false,autoGainControl:false}});
+workletReady??=ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET],{type:'application/javascript'})));await workletReady;
+const source=ctx.createMediaStreamSource(mic),node=new AudioWorkletNode(ctx,'pcm16'),mute=ctx.createGain();mute.gain.value=0;source.connect(node).connect(mute).connect(ctx.destination);
+const socket=new WebSocket(wsUrl('/ws/listen')),pending=[];const live=bubble('user','…');live.classList.add('live');
+node.port.onmessage=e=>socket.readyState===WebSocket.OPEN?socket.send(e.data):pending.push(e.data);socket.onopen=()=>pending.splice(0).forEach(c=>socket.send(c));
+const stopMic=()=>{node.port.onmessage=null;source.disconnect();node.disconnect();mic.getTracks().forEach(t=>t.stop());$('stop').disabled=true};
+const finish=()=>{if(listening?.socket!==socket)return false;listening=null;stopMic();socket.onclose=null;socket.close();live.remove();return true};
+listening={socket,finish,stop(){stopMic();if(socket.readyState===WebSocket.OPEN)socket.send(JSON.stringify({type:'stop'}));status('Transcrevendo…')}};
+socket.onmessage=e=>{const m=JSON.parse(e.data);
+if(m.type==='partial'){live.textContent=m.text;$('chat').scrollTop=$('chat').scrollHeight}
+else if(m.type==='end_of_speech'){stopMic();status('Transcrevendo…')}
+else if(m.type==='final'){if(!finish())return;if(m.text)converse(m.text);else{status(conversing?'Conversa pausada: não ouvi nada. Clique em Falar para continuar.':'Não ouvi nada. Tente novamente.',!conversing);setConversing(false);lock(false)}}
+else if(m.type==='error'){if(finish()){setConversing(false);status(m.detail,true);lock(false)}}};
+socket.onclose=()=>{if(finish()){setConversing(false);status('Conexão com o ASR encerrada.',true);lock(false)}};
+lock(true);$('stop').disabled=false;status('Ouvindo… pode falar.')}
+$('record').onclick=()=>{if(conversing){setConversing(false);listening?.finish();abortTurn();lock(false);status('Conversa encerrada.');return}abortTurn();setConversing($('auto').checked);startListening()};
+$('auto').onchange=()=>{if(!$('auto').checked&&conversing)setConversing(false)};
+$('stop').onclick=()=>listening?.stop();
+$('form').onsubmit=e=>{e.preventDefault();const text=$('message').value.trim();if(!text||busy)return;$('message').value='';converse(text)};
+$('cancel').onclick=()=>{setConversing(false);listening?.finish();lock(false);abortTurn();history=[];$('chat').replaceChildren();status('Conversa limpa.')};
+</script></body></html>

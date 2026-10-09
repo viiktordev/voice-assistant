@@ -1,0 +1,11 @@
+services:
+  voice-assistant:
+    build: .
+    container_name: voice-assistant
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
