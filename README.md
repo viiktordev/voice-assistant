@@ -1,37 +1,55 @@
 # Local Voice Assistant
 
-Interface web com FastAPI, Nemotron ASR (gRPC), Qwen3 no Ollama (HTTP) e Qwen3-TTS (HTTP).
+Web voice assistant built with FastAPI, Nemotron ASR (Riva gRPC), Qwen3 on Ollama (HTTP) and Qwen3-TTS (HTTP). Speech recognition, the LLM response and speech synthesis all stream, so the assistant starts talking before the full answer is ready.
 
-## Executar
+## Running
 
 ```bash
 cp .env.example .env
 docker compose up -d --build
 ```
 
-Acesse `http://localhost:8080` no Linux com os serviços ou `http://IP_DA_GPU:8080` em outro computador. **Para acesso ao microfone em um navegador remoto (MacBook), é necessário HTTPS** ou um acesso via `localhost` (por exemplo, tunelamento SSH):
+Open `http://localhost:8080` on the Linux host running the services, or `http://GPU_HOST_IP:8080` from another machine. **Browsers only allow microphone access over HTTPS or `localhost`**, so from a remote machine (e.g. a MacBook) use an SSH tunnel:
 
 ```bash
-# Executar no MacBook
-ssh -L 8080:localhost:8080 usuario@ai-gpu-lab
-# Navegar para http://localhost:8080
+# On the MacBook
+ssh -L 8080:localhost:8080 user@ai-gpu-lab
+# Then browse to http://localhost:8080
 ```
 
-O Compose só sobe a interface FastAPI. Nemotron, Ollama e Qwen3-TTS continuam como serviços separados, já instalados no host de GPU. Ajuste `.env` conforme os endereços reais. Se o Ollama escutar apenas 127.0.0.1, configure um bind apropriado (`OLLAMA_HOST=0.0.0.0:11434`) **com firewall restringindo acesso à rede confiável**, ou use `network_mode: host` no Compose (Linux) e altere os endpoints para `localhost`. Se o ASR ou TTS tiverem portas publicadas apenas em 127.0.0.1, use também `network_mode: host` e remova `ports` e `extra_hosts` do Compose; com isso, `.env` deve apontar `localhost`.
+Compose only starts the FastAPI app. Nemotron, Ollama and Qwen3-TTS run as separate services on the GPU host; set their addresses in `.env`. If Ollama only listens on 127.0.0.1, bind it to the network (`OLLAMA_HOST=0.0.0.0:11434`) **behind a firewall that restricts access to your trusted network**, or use `network_mode: host` in Compose (Linux) and point the endpoints to `localhost`. If the ASR or TTS ports are only published on 127.0.0.1, also use `network_mode: host`, remove `ports` and `extra_hosts` from Compose and point `.env` to `localhost`.
 
-## Fluxo
+The TTS server must expose `POST /synthesize/stream`, returning raw 16-bit mono PCM in chunks as it is generated, with the sample rate in the `X-Sample-Rate` header (in addition to the regular `/synthesize`, which returns a full WAV).
 
-1. Navegador captura o microfone (AudioWorklet, PCM 16 kHz) e envia por WebSocket (`/ws/listen`) enquanto você fala; a transcrição aparece ao vivo e o envio é automático quando você para de falar (~0,8 s de silêncio).
-2. FastAPI repassa o áudio ao Nemotron via Riva `StreamingRecognize`. O servidor ASR não detecta fim de fala, então o backend faz isso pela energia do áudio (com reserva pela transcrição parada).
-3. A transcrição vai por WebSocket (`/ws/chat`) ao backend, que chama o Ollama em streaming com histórico das últimas 12 mensagens; o texto aparece na tela conforme é gerado.
-4. A cada frase completa, o backend já chama o endpoint `/synthesize` do Qwen3-TTS (uma frase por vez, em ordem) enquanto o LLM continua gerando, e envia o WAV pelo mesmo WebSocket.
-5. O navegador enfileira os áudios com Web Audio API e toca as frases em sequência, sem esperar a resposta inteira.
+## Configuration
 
-## Observações
+| Variable | Default | Description |
+|---|---|---|
+| `ASR_SERVER` | `host.docker.internal:50051` | Riva/Nemotron gRPC address |
+| `ASR_LANGUAGE` | `pt-BR` | Recognition language |
+| `ASR_END_SILENCE_MS` | `800` | Silence that ends an utterance |
+| `ASR_VAD_MIN_RMS` | `50` | Minimum energy (16-bit PCM) counted as voice; above it, 3x the measured noise floor is used |
+| `OLLAMA_URL` | `http://host.docker.internal:11434` | Ollama address |
+| `OLLAMA_MODEL` | `qwen3:8b` | Model used for answers (thinking disabled for latency) |
+| `TTS_URL` | `http://host.docker.internal:8000/synthesize` | Full-WAV synthesis endpoint |
+| `TTS_STREAM_URL` | `TTS_URL` + `/stream` | Streaming synthesis endpoint |
+| `TTS_LANGUAGE` / `TTS_SPEAKER` | `Portuguese` / `Ryan` | Qwen3-TTS voice |
+| `SYSTEM_PROMPT` | short Portuguese prompt | LLM system prompt |
 
-- A conversa é **por turnos**: LLM e TTS são encadeados por frase, mas não há barge-in (falar por cima do assistente).
-- O modelo Nemotron precisa aceitar chamadas de reconhecimento não-streaming (`Recognize`). Caso o servidor exponha somente `StreamingRecognize`, adapte o cliente ao gRPC streaming.
-- É necessária permissão do microfone no navegador.
-- A API não inclui autenticação: **não exponha a porta 8080 diretamente à internet**.
-- O frontend foi criado sem dependências Node.js; CSS e JavaScript estão em `app/static/index.html`.
-- Teste isolado: `curl http://localhost:8080/health`.
+## How it works
+
+1. The browser captures the microphone (AudioWorklet, 16 kHz PCM) and sends it over a WebSocket (`/ws/listen`) while you speak. The transcript appears live, and the message is sent automatically once you stop talking.
+2. The backend forwards the audio to Nemotron through Riva `StreamingRecognize`. The ASR server does not detect the end of speech, so the backend does it using audio energy (with a fallback on the transcript going unchanged).
+3. The transcript goes over a WebSocket (`/ws/chat`) to the backend, which streams from Ollama with the last 12 messages of history; the text shows up as it is generated.
+4. As soon as each sentence is complete, the backend sends it to `/synthesize/stream` (one sentence at a time, in order) while the LLM keeps generating, and relays the PCM chunks over the same WebSocket as they arrive.
+5. The browser schedules the chunks back to back with the Web Audio API, without waiting for the full answer.
+6. In **continuous conversation** mode (on by default), the microphone reopens once the answer finishes playing. The conversation pauses after ~8 s of silence; click **Falar** again to resume.
+
+## Notes
+
+- Conversation is **turn-based**: there is no barge-in (talking over the assistant), since the microphone only reopens after playback ends.
+- Microphone permission is required in the browser.
+- The API has no authentication: **do not expose port 8080 directly to the internet**.
+- The frontend has no Node.js dependencies; CSS and JavaScript live in `app/static/index.html`.
+- `scripts/check_asr.py` checks which recognition modes the ASR server supports: `docker exec -i voice-assistant python - < scripts/check_asr.py`.
+- Quick check: `curl http://localhost:8080/health`.
